@@ -13,6 +13,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 
 import cv2
@@ -48,6 +49,142 @@ app.config["SECRET_KEY"] = "arvrcv-base-server-secret"
 
 # allow_upgrades=True garante suporte a WebSocket via eventlet/gevent
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", logger=False, engineio_logger=False)
+
+# Classificador de rosto carregado uma única vez - melhorando o desempenho
+FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+# Estado simples de rastreamento para rostos -> entidades no VR
+face_tracking_state = {
+    "next_id": 1,
+    "tracks": {},
+}
+
+
+def _iou(rect_a, rect_b):
+    """Calcula IoU entre dois retângulos no formato {'x','y','w','h'}."""
+    ax1, ay1 = rect_a["x"], rect_a["y"]
+    ax2, ay2 = ax1 + rect_a["w"], ay1 + rect_a["h"]
+    bx1, by1 = rect_b["x"], rect_b["y"]
+    bx2, by2 = bx1 + rect_b["w"], by1 + rect_b["h"]
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = rect_a["w"] * rect_a["h"]
+    area_b = rect_b["w"] * rect_b["h"]
+    union = max(area_a + area_b - inter_area, 1)
+    return inter_area / union
+
+
+def _center_distance(rect_a, rect_b):
+    ax = rect_a["x"] + rect_a["w"] / 2.0
+    ay = rect_a["y"] + rect_a["h"] / 2.0
+    bx = rect_b["x"] + rect_b["w"] / 2.0
+    by = rect_b["y"] + rect_b["h"] / 2.0
+    return math.hypot(ax - bx, ay - by)
+
+
+def _map_face_to_vr(rect, img_w, img_h):
+    """Mapeia um retângulo de rosto em pixels para coordenadas aproximadas no VR."""
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+
+    norm_x = (cx / max(img_w, 1)) * 2.0 - 1.0
+    norm_y = 1.0 - (cy / max(img_h, 1)) * 2.0
+
+    vr_x = norm_x * 4.0
+    vr_y = norm_y * 2.2 + 1.6
+
+    face_ratio = w / max(img_w, 1)
+    # rosto maior -> mais perto da câmera -> menos negativo no eixo Z
+    vr_z = -8.0 + min(face_ratio * 18.0, 5.5)
+
+    return {
+        "x": round(vr_x, 2),
+        "y": round(vr_y, 2),
+        "z": round(vr_z, 2),
+    }
+
+
+def _track_faces_for_vr(face_rects, img_w, img_h):
+    """
+    Atribui IDs estáveis aos rostos e gera entidades para o ambiente VR.
+    Usa uma associação simples por IoU/distância + suavização de movimento.
+    """
+    tracks = face_tracking_state["tracks"]
+    updated_tracks = {}
+    used_track_ids = set()
+    people = []
+
+    # Associa cada face detectada a uma trilha existente
+    for rect in face_rects:
+        best_track_id = None
+        best_score = -1.0
+
+        for track_id, track in tracks.items():
+            if track_id in used_track_ids:
+                continue
+
+            prev_rect = track["rect"]
+            iou = _iou(rect, prev_rect)
+            dist = _center_distance(rect, prev_rect)
+            score = iou - (dist / max(img_w, img_h, 1)) * 0.35
+
+            if iou >= 0.10 or dist <= max(60, 0.12 * max(img_w, img_h)):
+                if score > best_score:
+                    best_score = score
+                    best_track_id = track_id
+
+        if best_track_id is None:
+            best_track_id = face_tracking_state["next_id"]
+            face_tracking_state["next_id"] += 1
+
+        used_track_ids.add(best_track_id)
+        vr_pos = _map_face_to_vr(rect, img_w, img_h)
+
+        previous = tracks.get(best_track_id)
+        if previous:
+            prev_pos = previous["position"]
+            alpha = 0.35
+            vr_pos = {
+                axis: round(prev_pos[axis] * (1.0 - alpha) + vr_pos[axis] * alpha, 2)
+                for axis in ("x", "y", "z")
+            }
+
+        updated_tracks[best_track_id] = {
+            "rect": rect,
+            "position": vr_pos,
+            "name": f"Pessoa {best_track_id}",
+        }
+        people.append({
+            "id": f"face_{best_track_id}",
+            "track_id": best_track_id,
+            "name": f"Pessoa {best_track_id}",
+            "position": vr_pos,
+            "rect": rect,
+        })
+
+    face_tracking_state["tracks"] = updated_tracks
+    return people
+
+
+def _emit_people_positions(people, source="cv"):
+    """Envia a posição das pessoas detectadas para o cliente AR/VR."""
+    socketio.emit("people_positions", {
+        "source": source,
+        "people": people,
+        "count": len(people),
+    }, to="arvr")
+
 
 # ---------------------------------------------------------------------------
 # MediaPipe – Detecção de mãos e pose (Tasks API)
@@ -553,6 +690,16 @@ def on_join_arvr():
     connected_clients["arvr"] += 1
     logger.info("Cliente entrou na sala arvr. Total: %d", connected_clients["arvr"])
     emit("scene_state", scene_state)
+    # Se já houver rostos sendo rastreados, envia o estado inicial das pessoas ao cliente AR/VR
+    existing_people = [{
+        "id": f"face_{track_id}",
+        "track_id": track_id,
+        "name": track["name"],
+        "position": track["position"],
+        "rect": track["rect"],
+    } for track_id, track in face_tracking_state["tracks"].items()]
+    emit("people_positions", {"source": "server", "people": existing_people, "count": len(existing_people)})
+
 
 
 @socketio.on("leave_arvr")
@@ -699,10 +846,21 @@ def on_cv_frame(data):
         _, buffer = cv2.imencode(".jpg", result_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         result_b64 = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
 
+        people = []
+        if pipeline == "faces":
+            face_rects = []
+            for item in detections:
+                if item.get("type") == "faces":
+                    face_rects = item.get("rects", [])
+                    break
+            people = _track_faces_for_vr(face_rects, frame.shape[1], frame.shape[0])
+            _emit_people_positions(people, source="cv")
+
         emit("cv_result", {
             "image": result_b64,
             "pipeline": pipeline,
             "detections": detections,
+            "people": people,
         })
 
     except Exception as exc:
@@ -732,13 +890,20 @@ def _apply_pipeline(frame: np.ndarray, pipeline: str):
     elif pipeline == "faces":
         # Usa classificador Haar para detecção de rostos
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         result = frame.copy()
-        for (x, y, w, h) in faces:
+        face_rects = []
+        for idx, (x, y, w, h) in enumerate(faces, start=1):
+            rect = {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
+            face_rects.append(rect)
             cv2.rectangle(result, (x, y), (x + w, y + h), (255, 0, 0), 2)
-            cv2.putText(result, "Rosto", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-        detections.append({"type": "faces", "count": len(faces), "text": f"{len(faces)} rosto(s) detectado(s)"})
+            cv2.putText(result, f"Rosto {idx}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        detections.append({
+            "type": "faces",
+            "count": len(faces),
+            "text": f"{len(faces)} rosto(s) detectado(s)",
+            "rects": face_rects,
+        })
 
     elif pipeline == "color":
         # Segmentação por cor – detecta tons de verde (HSV)
@@ -923,14 +1088,13 @@ def _apply_pipeline_3d(frame: np.ndarray, pipeline: str):
 
     elif pipeline == "faces":
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         rects = []
         for (x, y, fw, fh) in faces:
-            rects.append({"x": int(x), "y": int(y), "w": int(fw), "h": int(fh)})
+            rect = {"x": int(x), "y": int(y), "w": int(fw), "h": int(fh)}
+            rects.append(rect)
         geometry["faces"] = rects
+        geometry["people"] = _track_faces_for_vr(rects, w, h)
 
     elif pipeline == "edges":
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1010,11 +1174,16 @@ def on_cv3d_frame(data):
         _, buffer = cv2.imencode(".jpg", result_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         result_b64 = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
 
+        people = geometry.get("people", []) if pipeline == "faces" else []
+        if people:
+            _emit_people_positions(people, source="cv3d")
+
         emit("cv3d_result", {
             "image": result_b64,
             "pipeline": pipeline,
             "detections": detections,
             "geometry": geometry,
+            "people": people,
         })
 
     except Exception as exc:
